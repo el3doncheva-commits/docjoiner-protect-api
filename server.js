@@ -27,13 +27,28 @@ function corsHeaders(origin) {
   return {};
 }
 
-function runQpdf({ inPath, outPath, password, bits }) {
+function runQpdf({ inPath, outPath, password }) {
   return new Promise((resolve, reject) => {
-    const args = ["--encrypt", password, password, String(bits), "--", inPath, outPath];
+    // 🔒 FORCE AES-256 (no weak crypto)
+    const args = [
+      "--encrypt",
+      password,
+      password,
+      "256",
+      "--",
+      inPath,
+      outPath
+    ];
+
     const proc = spawn("qpdf", args, { stdio: ["ignore", "pipe", "pipe"] });
+
     let stderr = "";
     proc.stderr.on("data", d => stderr += d.toString());
-    proc.on("close", code => code === 0 ? resolve() : reject(new Error(stderr || `qpdf failed (${code})`)));
+
+    proc.on("close", code => {
+      if (code === 0) return resolve();
+      reject(new Error(stderr || `qpdf failed (${code})`));
+    });
   });
 }
 
@@ -46,11 +61,8 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  if (req.url !== "/api/protect") {
+  if (req.url !== "/api/protect" || req.method !== "POST") {
     return send(res, 404, "Not found");
-  }
-  if (req.method !== "POST") {
-    return send(res, 405, "Method not allowed", cors);
   }
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dj-protect-"));
@@ -58,7 +70,6 @@ const server = http.createServer(async (req, res) => {
   const outPath = path.join(tmpDir, "output.pdf");
 
   let password = "";
-  let bits = 128;
   let gotFile = false;
 
   try {
@@ -72,7 +83,6 @@ const server = http.createServer(async (req, res) => {
 
     bb.on("field", (n, v) => {
       if (n === "password") password = String(v || "");
-      if (n === "bits") bits = String(v) === "256" ? 256 : 128;
     });
 
     await new Promise((resolve, reject) => {
@@ -85,7 +95,7 @@ const server = http.createServer(async (req, res) => {
     if (!gotFile) return send(res, 400, "Missing file.", cors);
     if (!password || password.length < 3) return send(res, 400, "Password too short.", cors);
 
-    await runQpdf({ inPath, outPath, password, bits });
+    await runQpdf({ inPath, outPath, password });
 
     const pdf = fs.readFileSync(outPath);
     res.writeHead(200, {
@@ -96,12 +106,10 @@ const server = http.createServer(async (req, res) => {
     });
     res.end(pdf);
   } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    return send(res, 500, "Protect failed: " + msg, cors);
+    return send(res, 500, "Protect failed: " + (e.message || e), cors);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
-const port = Number(process.env.PORT || 3000);
-server.listen(port, () => console.log("Listening on " + port));
+server.listen(3000, () => console.log("Protect API running (AES-256 only)"));
