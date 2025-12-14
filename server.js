@@ -27,9 +27,9 @@ function corsHeaders(origin) {
   return {};
 }
 
-function runQpdf({ inPath, outPath, password }) {
+// Protect: AES-256 encrypt
+function qpdfProtect({ inPath, outPath, password }) {
   return new Promise((resolve, reject) => {
-    // 🔒 FORCE AES-256 (no weak crypto)
     const args = [
       "--encrypt",
       password,
@@ -43,13 +43,75 @@ function runQpdf({ inPath, outPath, password }) {
     const proc = spawn("qpdf", args, { stdio: ["ignore", "pipe", "pipe"] });
 
     let stderr = "";
-    proc.stderr.on("data", d => stderr += d.toString());
+    proc.stderr.on("data", d => (stderr += d.toString()));
 
     proc.on("close", code => {
       if (code === 0) return resolve();
-      reject(new Error(stderr || `qpdf failed (${code})`));
+      reject(new Error(stderr || `qpdf protect failed (${code})`));
     });
   });
+}
+
+// Unlock: decrypt (remove open password) using provided password
+function qpdfUnlock({ inPath, outPath, password }) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      `--password=${password}`,
+      "--decrypt",
+      "--",
+      inPath,
+      outPath
+    ];
+
+    const proc = spawn("qpdf", args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stderr = "";
+    proc.stderr.on("data", d => (stderr += d.toString()));
+
+    proc.on("close", code => {
+      if (code === 0) return resolve();
+      reject(new Error(stderr || `qpdf unlock failed (${code})`));
+    });
+  });
+}
+
+async function parseMultipartPdfAndPassword(req, { inPath }) {
+  let password = "";
+  let gotFile = false;
+  let fileTooLarge = false;
+
+  const bb = Busboy({
+    headers: req.headers,
+    limits: { fileSize: 60 * 1024 * 1024 } // 60 MB
+  });
+
+  bb.on("file", (name, file) => {
+    if (name !== "file") {
+      file.resume();
+      return;
+    }
+    gotFile = true;
+
+    file.on("limit", () => {
+      fileTooLarge = true;
+      file.resume();
+    });
+
+    file.pipe(fs.createWriteStream(inPath));
+  });
+
+  bb.on("field", (n, v) => {
+    if (n === "password") password = String(v || "");
+  });
+
+  await new Promise((resolve, reject) => {
+    bb.on("finish", resolve);
+    bb.on("error", reject);
+    req.on("error", reject);
+    req.pipe(bb);
+  });
+
+  return { password, gotFile, fileTooLarge };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -61,55 +123,56 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  if (req.url !== "/api/protect" || req.method !== "POST") {
-    return send(res, 404, "Not found");
+  // Only POST endpoints we support
+  const isProtect = req.url === "/api/protect" && req.method === "POST";
+  const isUnlock = req.url === "/api/unlock" && req.method === "POST";
+
+  if (!isProtect && !isUnlock) {
+    return send(res, 404, "Not found", cors);
   }
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dj-protect-"));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), isProtect ? "dj-protect-" : "dj-unlock-"));
   const inPath = path.join(tmpDir, "input.pdf");
   const outPath = path.join(tmpDir, "output.pdf");
 
-  let password = "";
-  let gotFile = false;
-
   try {
-    const bb = Busboy({ headers: req.headers, limits: { fileSize: 60 * 1024 * 1024 } });
+    const { password, gotFile, fileTooLarge } = await parseMultipartPdfAndPassword(req, { inPath });
 
-    bb.on("file", (name, file) => {
-      if (name !== "file") { file.resume(); return; }
-      gotFile = true;
-      file.pipe(fs.createWriteStream(inPath));
-    });
-
-    bb.on("field", (n, v) => {
-      if (n === "password") password = String(v || "");
-    });
-
-    await new Promise((resolve, reject) => {
-      bb.on("finish", resolve);
-      bb.on("error", reject);
-      req.on("error", reject);
-      req.pipe(bb);
-    });
-
+    if (fileTooLarge) return send(res, 413, "File too large (max 60MB).", cors);
     if (!gotFile) return send(res, 400, "Missing file.", cors);
-    if (!password || password.length < 3) return send(res, 400, "Password too short.", cors);
 
-    await runQpdf({ inPath, outPath, password });
+    // For unlock we allow any length >= 1 (some PDFs have 1-2 char passwords)
+    if (isProtect) {
+      if (!password || password.length < 3) return send(res, 400, "Password too short.", cors);
+      await qpdfProtect({ inPath, outPath, password });
+    } else {
+      if (!password) return send(res, 400, "Missing password.", cors);
+      try {
+        await qpdfUnlock({ inPath, outPath, password });
+      } catch (e) {
+        // Wrong password / cannot decrypt -> 403
+        return send(res, 403, "Incorrect password or cannot unlock this PDF.", cors);
+      }
+    }
 
     const pdf = fs.readFileSync(outPath);
+
     res.writeHead(200, {
       ...cors,
       "Content-Type": "application/pdf",
-      "Content-Disposition": 'attachment; filename="protected.pdf"',
+      "Content-Disposition": isProtect
+        ? 'attachment; filename="protected.pdf"'
+        : 'attachment; filename="unlocked.pdf"',
       "Cache-Control": "no-store"
     });
     res.end(pdf);
+
   } catch (e) {
-    return send(res, 500, "Protect failed: " + (e.message || e), cors);
+    const label = isProtect ? "Protect failed: " : "Unlock failed: ";
+    return send(res, 500, label + (e.message || e), cors);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
-server.listen(3000, () => console.log("Protect API running (AES-256 only)"));
+server.listen(3000, () => console.log("DocJoiner API running (/api/protect + /api/unlock)"));
